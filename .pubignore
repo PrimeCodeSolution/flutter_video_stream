@@ -1,0 +1,28 @@
+# Development files
+.github/
+.vscode/
+.idea/
+
+# Example app (pub.dev will automatically include if valid)
+# Keeping example/ as it's standard practice
+
+# Test coverage
+coverage/
+
+# Build outputs
+build/
+.dart_tool/
+
+# Documentation source (keep only generated)
+doc/
+
+# CI/CD
+.travis.yml
+.circleci/
+
+# IDE files
+*.iml
+
+# OS files
+.DS_Store
+Thumbs.db

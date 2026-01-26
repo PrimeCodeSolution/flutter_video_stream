@@ -1,0 +1,29 @@
+name: flutter_video_stream
+description: "High-performance video streaming package for Flutter with intelligent caching, controller pooling, and preloading. Supports MP4 and HLS formats on mobile and web."
+version: 0.1.0
+homepage: https://github.com/PrimeCodeSolution/flutter_video_stream
+repository: https://github.com/PrimeCodeSolution/flutter_video_stream
+issue_tracker: https://github.com/PrimeCodeSolution/flutter_video_stream/issues
+topics:
+  - video
+  - streaming
+  - cache
+  - video-player
+  - hls
+
+environment:
+  sdk: '>=3.3.0 <4.0.0'
+  flutter: ">=3.19.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  video_player: ^2.8.0
+  path_provider: ^2.1.0
+  crypto: ^3.0.0
+  web: ^1.1.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
