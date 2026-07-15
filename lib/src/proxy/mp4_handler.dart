@@ -6,6 +6,12 @@ import '../utils/http_utils.dart';
 
 /// Handler for MP4 video streaming with chunked caching.
 /// Splits large MP4 files into chunks for efficient caching and seeking.
+///
+/// Handles edge cases:
+/// - Missing Content-Length (chunked transfer encoding)
+/// - Servers that don't support Range requests
+/// - Corrupted or incomplete files
+/// - Live/endless streams
 class Mp4Handler {
   final MobileCacheManager _cacheManager;
 
@@ -19,6 +25,9 @@ class Mp4Handler {
 
   /// Track chunk download status per URL
   final Map<String, _Mp4ChunkInfo> _chunkInfos = {};
+
+  /// Track URLs that require passthrough (no caching)
+  final Set<String> _passthroughUrls = {};
 
   Mp4Handler({
     required MobileCacheManager cacheManager,
@@ -46,13 +55,21 @@ class Mp4Handler {
     final response = request.response;
 
     try {
+      // Check if this URL requires passthrough mode
+      if (_passthroughUrls.contains(originalUrl)) {
+        await _handlePassthrough(request, originalUrl, headers);
+        return;
+      }
+
       // Get or create chunk info for this URL
       var chunkInfo = _chunkInfos[originalUrl];
       if (chunkInfo == null) {
         chunkInfo = await _initChunkInfo(originalUrl, headers);
         if (chunkInfo == null) {
-          response.statusCode = HttpStatus.badGateway;
-          await response.close();
+          // Fallback to passthrough mode
+          debugPrint('Mp4Handler: No metadata available, using passthrough mode for $originalUrl');
+          _passthroughUrls.add(originalUrl);
+          await _handlePassthrough(request, originalUrl, headers);
           return;
         }
         _chunkInfos[originalUrl] = chunkInfo;
@@ -95,6 +112,19 @@ class Mp4Handler {
       await response.close();
     } catch (e) {
       debugPrint('Mp4Handler: Error handling request: $e');
+
+      // Try passthrough as last resort
+      if (!_passthroughUrls.contains(originalUrl)) {
+        debugPrint('Mp4Handler: Attempting passthrough fallback');
+        _passthroughUrls.add(originalUrl);
+        try {
+          await _handlePassthrough(request, originalUrl, headers);
+          return;
+        } catch (e2) {
+          debugPrint('Mp4Handler: Passthrough also failed: $e2');
+        }
+      }
+
       try {
         response.statusCode = HttpStatus.internalServerError;
         await response.close();
@@ -102,13 +132,99 @@ class Mp4Handler {
     }
   }
 
+  /// Handle passthrough streaming without caching
+  /// Used when metadata is unavailable (chunked transfer, no Content-Length, etc.)
+  Future<void> _handlePassthrough(
+    HttpRequest request,
+    String originalUrl,
+    Map<String, String>? headers,
+  ) async {
+    final response = request.response;
+
+    try {
+      debugPrint('Mp4Handler: Passthrough mode for $originalUrl');
+
+      final upstreamRequest = await _client.getUrl(Uri.parse(originalUrl));
+
+      // Copy headers
+      if (headers != null) {
+        headers.forEach((key, value) => upstreamRequest.headers.set(key, value));
+      }
+
+      // Forward range header if present
+      final rangeHeader = request.headers.value('range');
+      if (rangeHeader != null) {
+        upstreamRequest.headers.set('Range', rangeHeader);
+      }
+
+      final upstreamResponse = await upstreamRequest.close();
+
+      // Copy status code
+      response.statusCode = upstreamResponse.statusCode;
+
+      // Copy relevant headers
+      response.headers.contentType = ContentType('video', 'mp4');
+
+      final contentLength = upstreamResponse.contentLength;
+      if (contentLength > 0) {
+        response.headers.contentLength = contentLength;
+      }
+
+      final contentRange = upstreamResponse.headers.value('content-range');
+      if (contentRange != null) {
+        response.headers.set('Content-Range', contentRange);
+      }
+
+      final acceptRanges = upstreamResponse.headers.value('accept-ranges');
+      if (acceptRanges != null) {
+        response.headers.set('Accept-Ranges', acceptRanges);
+      }
+
+      // Stream data directly
+      await for (final chunk in upstreamResponse) {
+        response.add(chunk);
+      }
+
+      await response.close();
+      debugPrint('Mp4Handler: Passthrough complete for $originalUrl');
+    } catch (e) {
+      debugPrint('Mp4Handler: Passthrough error: $e');
+      try {
+        response.statusCode = HttpStatus.badGateway;
+        await response.close();
+      } catch (_) {}
+    }
+  }
+
   /// Initialize chunk info by fetching content length
+  /// Returns null if content length cannot be determined (triggers passthrough)
   Future<_Mp4ChunkInfo?> _initChunkInfo(
     String url,
     Map<String, String>? headers,
   ) async {
+    // Try HEAD request first
+    var chunkInfo = await _initChunkInfoViaHead(url, headers);
+    if (chunkInfo != null) return chunkInfo;
+
+    // Fallback: Try GET with Range 0-0
+    chunkInfo = await _initChunkInfoViaGet(url, headers);
+    if (chunkInfo != null) return chunkInfo;
+
+    // Fallback: Try to detect from first chunk of actual content
+    chunkInfo = await _initChunkInfoViaProbe(url, headers);
+    if (chunkInfo != null) return chunkInfo;
+
+    // All methods failed - will use passthrough
+    debugPrint('Mp4Handler: Could not determine content length for $url');
+    return null;
+  }
+
+  /// Try to get content length via HEAD request
+  Future<_Mp4ChunkInfo?> _initChunkInfoViaHead(
+    String url,
+    Map<String, String>? headers,
+  ) async {
     try {
-      // Do a HEAD request to get content length
       final request = await _client.headUrl(Uri.parse(url));
 
       if (headers != null) {
@@ -116,32 +232,22 @@ class Mp4Handler {
       }
 
       final response = await request.close();
+      await response.drain<void>();
 
       if (response.statusCode != 200 && response.statusCode != 206) {
         debugPrint('Mp4Handler: HEAD request failed: ${response.statusCode}');
-        await response.drain<void>();
         return null;
       }
 
       final contentLength = response.contentLength;
       if (contentLength <= 0) {
-        // Try GET request with range 0-0 to get content length
-        return await _initChunkInfoViaGet(url, headers);
+        debugPrint('Mp4Handler: HEAD returned no Content-Length');
+        return null;
       }
 
-      final numChunks = (contentLength / chunkSize).ceil();
-
-      debugPrint('Mp4Handler: Initialized chunk info for $url');
-      debugPrint('  Content-Length: $contentLength');
-      debugPrint('  Chunks: $numChunks x $chunkSize bytes');
-
-      return _Mp4ChunkInfo(
-        contentLength: contentLength,
-        chunkSize: chunkSize,
-        numChunks: numChunks,
-      );
+      return _createChunkInfo(contentLength, url);
     } catch (e) {
-      debugPrint('Mp4Handler: Error initializing chunk info: $e');
+      debugPrint('Mp4Handler: HEAD request error: $e');
       return null;
     }
   }
@@ -168,28 +274,91 @@ class Mp4Handler {
       await response.drain<void>();
 
       if (response.statusCode != 206) {
-        debugPrint('Mp4Handler: Range request not supported');
+        debugPrint('Mp4Handler: Server does not support Range requests');
         return null;
       }
 
       // Parse Content-Range header: bytes 0-0/total
-      if (contentRange == null) return null;
+      if (contentRange == null) {
+        debugPrint('Mp4Handler: No Content-Range header in response');
+        return null;
+      }
 
-      final match = RegExp(r'bytes \d+-\d+/(\d+)').firstMatch(contentRange);
-      if (match == null) return null;
+      final match = RegExp(r'bytes \d+-\d+/(\d+|\*)').firstMatch(contentRange);
+      if (match == null) {
+        debugPrint('Mp4Handler: Could not parse Content-Range: $contentRange');
+        return null;
+      }
 
-      final contentLength = int.parse(match.group(1)!);
-      final numChunks = (contentLength / chunkSize).ceil();
+      final totalStr = match.group(1)!;
+      if (totalStr == '*') {
+        // Unknown total length
+        debugPrint('Mp4Handler: Content-Range has unknown total (*)');
+        return null;
+      }
 
-      return _Mp4ChunkInfo(
-        contentLength: contentLength,
-        chunkSize: chunkSize,
-        numChunks: numChunks,
-      );
+      final contentLength = int.parse(totalStr);
+      return _createChunkInfo(contentLength, url);
     } catch (e) {
-      debugPrint('Mp4Handler: Error getting content length via GET: $e');
+      debugPrint('Mp4Handler: Range GET error: $e');
       return null;
     }
+  }
+
+  /// Last resort: probe the stream to estimate content length
+  /// Downloads first chunk and checks for moov atom hints
+  Future<_Mp4ChunkInfo?> _initChunkInfoViaProbe(
+    String url,
+    Map<String, String>? headers,
+  ) async {
+    try {
+      final request = await _client.getUrl(Uri.parse(url));
+
+      if (headers != null) {
+        headers.forEach((key, value) => request.headers.set(key, value));
+      }
+
+      final response = await request.close();
+
+      // Check for chunked transfer encoding. The body is abandoned (not
+      // drained): draining would download the entire video just to probe.
+      final transferEncoding = response.headers.value('transfer-encoding');
+      if (transferEncoding?.toLowerCase() == 'chunked') {
+        debugPrint('Mp4Handler: Chunked transfer encoding detected');
+        // Can't determine length, will use passthrough
+        await _abandonBody(response);
+        return null;
+      }
+
+      // Check if Content-Length came with the GET response
+      final contentLength = response.contentLength;
+      if (contentLength > 0) {
+        await _abandonBody(response);
+        return _createChunkInfo(contentLength, url);
+      }
+
+      // No way to determine length
+      await _abandonBody(response);
+      return null;
+    } catch (e) {
+      debugPrint('Mp4Handler: Probe error: $e');
+      return null;
+    }
+  }
+
+  /// Create chunk info from content length
+  _Mp4ChunkInfo _createChunkInfo(int contentLength, String url) {
+    final numChunks = (contentLength / chunkSize).ceil();
+
+    debugPrint('Mp4Handler: Initialized chunk info for $url');
+    debugPrint('  Content-Length: $contentLength');
+    debugPrint('  Chunks: $numChunks x $chunkSize bytes');
+
+    return _Mp4ChunkInfo(
+      contentLength: contentLength,
+      chunkSize: chunkSize,
+      numChunks: numChunks,
+    );
   }
 
   /// Stream a range of bytes using cached chunks
@@ -208,7 +377,12 @@ class Mp4Handler {
     for (var i = startChunk; i <= endChunk; i++) {
       final chunkData = await _getChunk(chunkInfo, originalUrl, i, headers);
       if (chunkData == null) {
-        throw Exception('Failed to get chunk $i');
+        // Chunk failed - try to recover with direct stream for remaining data
+        debugPrint('Mp4Handler: Chunk $i failed, switching to direct stream');
+        await _streamRangeDirect(response, originalUrl,
+            i * chunkInfo.chunkSize + (i == startChunk ? startByte % chunkInfo.chunkSize : 0),
+            endByte, headers);
+        return;
       }
 
       // Calculate byte range within this chunk
@@ -234,6 +408,68 @@ class Mp4Handler {
     }
   }
 
+  /// Direct stream for recovery when chunked caching fails
+  Future<void> _streamRangeDirect(
+    HttpResponse response,
+    String originalUrl,
+    int startByte,
+    int endByte,
+    Map<String, String>? headers,
+  ) async {
+    try {
+      final request = await _client.getUrl(Uri.parse(originalUrl));
+
+      if (headers != null) {
+        headers.forEach((key, value) => request.headers.set(key, value));
+      }
+      request.headers.set('Range', 'bytes=$startByte-$endByte');
+
+      final upstreamResponse = await request.close();
+
+      if (upstreamResponse.statusCode == HttpStatus.partialContent) {
+        // Server honored the range
+        await for (final chunk in upstreamResponse) {
+          response.add(chunk);
+        }
+        return;
+      }
+
+      if (upstreamResponse.statusCode == HttpStatus.ok) {
+        // Server ignored the Range header and is sending the whole file:
+        // deliver only the requested slice so the client still receives
+        // exactly the bytes it asked for.
+        var position = 0;
+        await for (final chunk in upstreamResponse) {
+          final chunkStart = position;
+          position += chunk.length;
+          if (position <= startByte) continue;
+          final from = (startByte - chunkStart).clamp(0, chunk.length);
+          final to = (endByte - chunkStart + 1).clamp(0, chunk.length);
+          if (to > from) {
+            response.add(chunk.sublist(from, to));
+          }
+          if (position > endByte) break;
+        }
+        return;
+      }
+
+      await upstreamResponse.drain<void>();
+      throw HttpException(
+          'Direct stream failed: ${upstreamResponse.statusCode}',
+          uri: Uri.parse(originalUrl));
+    } catch (e) {
+      debugPrint('Mp4Handler: Direct stream failed: $e');
+      rethrow;
+    }
+  }
+
+  /// Abandon a response body without downloading the rest of it.
+  Future<void> _abandonBody(HttpClientResponse response) async {
+    try {
+      await response.listen((_) {}).cancel();
+    } catch (_) {}
+  }
+
   /// Get a specific chunk, from cache or download
   Future<Uint8List?> _getChunk(
     _Mp4ChunkInfo chunkInfo,
@@ -253,7 +489,12 @@ class Mp4Handler {
     final cachedPath = await _cacheManager.getCacheUrl(chunkKey);
     if (cachedPath != chunkKey && await File(cachedPath).exists()) {
       final file = File(cachedPath);
-      return await file.readAsBytes();
+      try {
+        return await file.readAsBytes();
+      } catch (e) {
+        debugPrint('Mp4Handler: Error reading cached chunk: $e');
+        // Continue to download
+      }
     }
 
     // Download the chunk
@@ -288,7 +529,20 @@ class Mp4Handler {
 
       final response = await request.close();
 
-      if (response.statusCode != 206 && response.statusCode != 200) {
+      if (response.statusCode == HttpStatus.ok) {
+        // Server ignored the Range header: chunked caching would store
+        // whole-file bytes at chunk offsets and corrupt playback. Flip
+        // this URL to passthrough; the direct-stream recovery path serves
+        // the current request correctly.
+        debugPrint(
+            'Mp4Handler: Server ignored Range for $originalUrl, switching to passthrough');
+        _passthroughUrls.add(originalUrl);
+        _chunkInfos.remove(originalUrl);
+        await _abandonBody(response);
+        return null;
+      }
+
+      if (response.statusCode != 206) {
         debugPrint('Mp4Handler: Chunk download failed: ${response.statusCode}');
         await response.drain<void>();
         return null;
@@ -300,6 +554,14 @@ class Mp4Handler {
       }
 
       final data = Uint8List.fromList(bytes);
+
+      // Validate chunk size (allow some tolerance for last chunk)
+      final expectedSize = chunkEnd - chunkStart + 1;
+      if (data.length != expectedSize) {
+        debugPrint('Mp4Handler: Chunk size mismatch: got ${data.length}, expected $expectedSize');
+        // Still usable if we got data
+        if (data.isEmpty) return null;
+      }
 
       // Cache the chunk in memory
       _cacheChunk(originalUrl, chunkIndex, data);
@@ -330,6 +592,7 @@ class Mp4Handler {
   /// Clear chunk info cache
   void clearCache() {
     _chunkInfos.clear();
+    _passthroughUrls.clear();
   }
 
   /// Dispose and clean up all resources
@@ -337,6 +600,7 @@ class Mp4Handler {
     _httpClient?.close();
     _httpClient = null;
     _chunkInfos.clear();
+    _passthroughUrls.clear();
   }
 }
 

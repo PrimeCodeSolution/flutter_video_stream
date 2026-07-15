@@ -34,6 +34,13 @@
   - `VideoStreamErrorType` enum: network, server, notFound, sourceNotCached,
     format, playback, unknown
   - Improved error UI with type-specific icons and messages
+- **Proxy edge-case handling for videos with missing metadata**
+  - Passthrough mode for chunked transfer encoding / missing Content-Length
+  - Content length detection fallbacks (HEAD, Range GET, probe) without
+    downloading the body
+  - Servers that ignore Range requests are detected and served via direct
+    streaming/passthrough instead of corrupting chunked playback
+  - Recovery via direct range streaming when a chunk download fails
 
 ## 0.1.0
 
