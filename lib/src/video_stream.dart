@@ -73,6 +73,21 @@ class VideoStream {
 
     _instance._controllerPool = ControllerPool(maxSize: config.poolSize);
 
+    // The size cap only evicts videos that are out of view: the cache asks
+    // the pool which keys are surfaced, and a video leaving view triggers a
+    // deferred eviction pass.
+    _instance._cacheManager.activeKeysProvider =
+        () => _instance._controllerPool.activeKeys;
+    _instance._controllerPool.onKeyReleased = (_) {
+      _instance._cacheManager.evictIfNeeded();
+    };
+    // When cached content disappears, its warm pooled controller must go
+    // too - otherwise a re-acquire would return a controller pointing at a
+    // deleted file / revoked blob instead of re-materializing.
+    _instance._cacheManager.onEvicted = (key) {
+      _instance._controllerPool.dropWarm(key);
+    };
+
     _instance._preloadManager = PreloadManager(
       cacheManager: _instance._cacheManager,
       preloadCount: config.preloadCount,
@@ -137,6 +152,37 @@ class VideoStream {
     _instance._preloadManager.precache(urls);
   }
 
+  /// Push caller-supplied [bytes] into the cache under [key] before a
+  /// player exists (e.g. right after a background download + decrypt
+  /// completes).
+  ///
+  /// The content participates in the cache exactly like fetched content:
+  /// counted by [getCacheSize], evicted by the size cap, removable via
+  /// [removeFromCache] and [clearCache]. A later
+  /// `VideoStreamPlayer(source: VideoSource.bytes(...))` (or any source
+  /// with the same [key]) plays straight from the cache.
+  ///
+  /// [mimeType] / [filename] are optional hints used to pick a file
+  /// extension (mobile) or blob type (web); `video/mp4` is assumed when
+  /// absent.
+  ///
+  /// The size cap never evicts a video that is currently surfaced (acquired
+  /// by a player), and content larger than the cap is still stored so it
+  /// can play - it is reclaimed by the eviction pass that runs once the
+  /// video leaves view.
+  ///
+  /// Throws [ArgumentError] if [bytes] is empty.
+  static Future<void> precacheBytes(
+    String key,
+    Uint8List bytes, {
+    String? mimeType,
+    String? filename,
+  }) async {
+    _ensureInitialized();
+    await _instance._cacheManager
+        .putBytes(key, bytes, mimeType: mimeType, filename: filename);
+  }
+
   /// Get cache status for a url
   static Future<CacheStatus> getCacheStatus(String url) async {
     _ensureInitialized();
@@ -147,6 +193,8 @@ class VideoStream {
   static Future<void> clearCache() async {
     _ensureInitialized();
     await _instance._cacheManager.clear();
+    // Warm controllers point at content that no longer exists
+    _instance._controllerPool.dropAllWarm();
   }
 
   /// Remove specific file from cache

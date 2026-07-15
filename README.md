@@ -13,6 +13,7 @@ High-performance video streaming package for Flutter with intelligent caching, c
 - **Play-While-Download** - Localhost proxy server streams video while caching (mobile)
 - **HLS Support** - Adaptive bitrate streaming with quality selection
 - **MP4 Chunking** - Range request support for efficient streaming
+- **Bring Your Own Bytes** - Inject decrypted/local content via `VideoSource.bytes` (e.g. E2EE attachments)
 - **Web Support** - Browser autoplay policy handling with user interaction detection
 - **Cross-Platform** - Works on Android, iOS, and Web
 
@@ -131,6 +132,72 @@ if (status == CacheStatus.complete) {
 }
 ```
 
+### Bring your own bytes (encrypted content)
+
+Some content can't be fetched by the package over HTTP — for example
+end-to-end encrypted attachments (Matrix, Signal-style protocols) that your
+app must download and decrypt itself. Hand the plaintext bytes over with
+`VideoSource.bytes` and the package takes care of caching, controller
+pooling, and playback from there. The package stays protocol-agnostic: it
+never sees ciphertext, keys, or your transport.
+
+```dart
+// 1. Your app downloads and decrypts (you own this part)
+final encrypted = await myTransport.download(attachmentUrl);
+final bytes = await myCrypto.decrypt(encrypted);
+
+// 2. Hand the plaintext to the player. `key` is any stable unique id
+//    (e.g. the message/event ID) — it plays the same role a URL plays for
+//    fetched videos: caching, pooling, and dedup are all keyed by it.
+VideoStreamPlayer(
+  source: VideoSource.bytes(
+    bytes,
+    key: message.id,
+    mimeType: 'video/mp4', // optional hint
+  ),
+);
+```
+
+You can also push content into the cache before any player exists, e.g.
+after a background download completes:
+
+```dart
+await VideoStream.precacheBytes(message.id, bytes);
+```
+
+Content that is already on disk skips the copy in memory:
+
+```dart
+VideoStreamPlayer(
+  source: VideoSource.file('/path/to/decrypted.mp4', key: message.id),
+);
+```
+
+Injected content participates in the cache like fetched content — it counts
+toward `getCacheSize()`, is evicted by the size cap once out of view, and can
+be removed with `removeFromCache(key)`. The package **never** fetches an
+injected key over HTTP, so if its cache entry was evicted and it can't be
+re-materialized locally (evicted `VideoSource.file` whose file is gone), the
+player surfaces `VideoStreamErrorType.sourceNotCached`. Your app re-downloads,
+re-decrypts, and re-injects:
+
+```dart
+VideoStreamPlayer(
+  source: VideoSource.file(cachePath, key: message.id),
+  onError: (error) async {
+    if (error.type == VideoStreamErrorType.sourceNotCached) {
+      final bytes = await myApp.redownloadAndDecrypt(message.id);
+      await VideoStream.precacheBytes(message.id, bytes);
+      // rebuild the player (e.g. via setState) to retry
+    }
+  },
+);
+```
+
+`VideoSource.bytes` self-heals: if its cache entry was evicted, the bytes it
+carries are transparently re-injected on the next acquire — no error, no
+network.
+
 ### Controlling Playback
 
 ```dart
@@ -219,7 +286,8 @@ The main singleton class for package initialization and control.
 |--------|-------------|
 | `initialize()` | Initialize the package with optional config |
 | `precache()` | Precache a list of video URLs |
-| `getCacheStatus()` | Get cache status for a URL |
+| `precacheBytes()` | Push caller-supplied bytes into the cache by key |
+| `getCacheStatus()` | Get cache status for a URL or source key |
 | `getCacheSize()` | Get total cache size in bytes |
 | `clearCache()` | Clear all cached videos |
 | `removeFromCache()` | Remove specific video from cache |
@@ -231,7 +299,8 @@ The main widget for video playback.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `url` | `String` | required | Video URL (MP4 or HLS) |
+| `url` | `String?` | – | Video URL (MP4 or HLS); or use `source` |
+| `source` | `VideoSource?` | – | URL, caller-supplied bytes, or file |
 | `autoPlay` | `bool` | `true` | Auto-start playback |
 | `looping` | `bool` | `true` | Loop video |
 | `muted` | `bool` | `false` | Start muted |

@@ -1,3 +1,40 @@
+## 0.2.0
+
+- **Bring your own bytes: `VideoSource` abstraction** for content the package
+  cannot fetch itself (e.g. end-to-end encrypted attachments the app downloads
+  and decrypts)
+  - `VideoSource.url(url, headers:)` — existing HTTP flow, unchanged
+  - `VideoSource.bytes(bytes, key:, mimeType:, filename:)` — caller-supplied
+    plaintext bytes, keyed by a stable id (e.g. a Matrix event ID)
+  - `VideoSource.file(path, key:)` — content already on disk
+  - `VideoStreamPlayer` accepts `source:` as an alternative to `url:` (the
+    `url:` parameter keeps working and forwards to `VideoSource.url`)
+  - `VideoStream.precacheBytes(key, bytes)` to push content into the cache
+    before a player exists (e.g. after a background download completes)
+- Injected sources bypass the HTTP proxy entirely: played from the disk cache
+  via file controllers on mobile, served through blob object URLs (with data
+  URI fallback) on web
+- Injected content participates in the existing cache LRU: counted by
+  `getCacheSize()`, evicted by the size cap, removable via
+  `removeFromCache(key)` / `clearCache()`
+- Controller pooling and dedup work by source key: acquiring the same key
+  twice (e.g. inline + fullscreen) reuses one controller
+- New `VideoSourceNotCachedException` + `VideoStreamErrorType.sourceNotCached`
+  when an injected source was evicted and cannot be re-materialized — the
+  package never fetches injected keys over HTTP; the app re-downloads and
+  re-injects
+- **Surfaced videos are never evicted**: the cache size cap only applies to
+  videos that are out of view. Content larger than the cap still plays (soft
+  cap) and is reclaimed once its player is released
+- Preloading treats injected sources as already-local no-ops without breaking
+  preload of neighboring URL sources in feeds
+- **Error callbacks and detailed error information**
+  - New `onError` callback on `VideoStreamPlayer`
+  - `VideoStreamError` class with type, message, URL, exception, and status code
+  - `VideoStreamErrorType` enum: network, server, notFound, sourceNotCached,
+    format, playback, unknown
+  - Improved error UI with type-specific icons and messages
+
 ## 0.1.0
 
 - Initial release

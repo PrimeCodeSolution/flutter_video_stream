@@ -1,3 +1,5 @@
+import 'dart:typed_data';
+
 /// Abstract interface for video cache management.
 ///
 /// The cache manager handles storing and retrieving video data from both
@@ -54,6 +56,44 @@ abstract class CacheManager {
   /// - [bytes]: Optional limit on how many bytes to cache (for partial preload)
   /// - [headers]: Optional HTTP headers for the request
   Future<void> precache(String url, {int? bytes, Map<String, String>? headers});
+
+  /// Stores caller-supplied [bytes] in the cache under [key].
+  ///
+  /// The entry participates in the cache exactly like downloaded content:
+  /// it is counted by [getSize], evicted by the LRU size cap, removable via
+  /// [remove], and cleared by [clear]. [mimeType] / [filename] are optional
+  /// hints used to pick a file extension (mobile) or blob type (web);
+  /// `video/mp4` is assumed when absent.
+  ///
+  /// The size cap is soft for content that is about to play or currently
+  /// playing: bytes larger than the cap are still stored (evicting
+  /// everything not surfaced) and are cleaned up by the next eviction pass
+  /// after the video leaves view.
+  ///
+  /// Throws [ArgumentError] if [bytes] is empty.
+  Future<void> putBytes(
+    String key,
+    Uint8List bytes, {
+    String? mimeType,
+    String? filename,
+  });
+
+  /// Provider of keys that are currently surfaced (acquired by at least one
+  /// player). Content for these keys is never evicted by the size cap —
+  /// eviction only ever touches videos that are out of view.
+  set activeKeysProvider(Set<String> Function()? provider);
+
+  /// Called whenever a key's cached content is deleted (size-cap eviction,
+  /// [remove], or replacement by a new [putBytes]). The controller pool
+  /// uses this to drop warm controllers whose backing content is gone, so
+  /// a re-acquire re-materializes instead of returning a dead controller.
+  set onEvicted(void Function(String key)? callback);
+
+  /// Runs a size-cap eviction pass now.
+  ///
+  /// Called automatically when a video leaves view so oversized or
+  /// over-quota content is reclaimed as soon as it is no longer surfaced.
+  Future<void> evictIfNeeded();
 
   /// Returns the cache status for a URL.
   Future<CacheStatus> getStatus(String url);

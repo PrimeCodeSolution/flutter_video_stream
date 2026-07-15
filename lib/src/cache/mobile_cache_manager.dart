@@ -43,6 +43,27 @@ class MobileCacheManager implements CacheManager {
   // Track in-flight downloads to prevent duplicates
   final Set<String> _inFlightDownloads = {};
 
+  /// Keys currently surfaced (acquired by a player); never evicted.
+  Set<String> Function()? _activeKeysProvider;
+
+  @override
+  set activeKeysProvider(Set<String> Function()? provider) {
+    _activeKeysProvider = provider;
+  }
+
+  /// Notified when a key's cached content is deleted (see [CacheManager.onEvicted]).
+  void Function(String key)? _onEvicted;
+
+  @override
+  set onEvicted(void Function(String key)? callback) {
+    _onEvicted = callback;
+  }
+
+  /// Monotonic counter so every putBytes gets its own temp file — the
+  /// shared `<cacheFile>.partial` name belongs to DownloadTracker's
+  /// resumable downloads and must not be raced or clobbered.
+  int _injectCounter = 0;
+
   // Metadata cache for better eviction performance
   List<CacheMetadata>? _metadataCache;
   DateTime? _metadataCacheTime;
@@ -143,6 +164,157 @@ class MobileCacheManager implements CacheManager {
     return File('${_cacheDir!.path}/$fileName$extension');
   }
 
+  /// Extensions injected content may have been stored under.
+  static const _knownExtensions = ['.mp4', '.webm', '.mov', '.m3u8', '.ts', '.m4s'];
+
+  /// Extension candidates for [key], most likely first: the key-derived
+  /// extension (URL flow stores under it), the bare hash, then every known
+  /// extension (injected content stores under a mimeType/filename-derived
+  /// extension that may differ from the key's).
+  List<String> _extensionCandidates(String key) {
+    final primary = _getExtension(key);
+    return <String>{
+      if (primary.isNotEmpty) primary,
+      '',
+      ..._knownExtensions,
+    }.toList();
+  }
+
+  /// Find the cache file for [key], whatever extension it was stored under.
+  Future<File?> _findCachedFile(String key) async {
+    if (_cacheDir == null) await initialize();
+    final fileName = _getFileName(key);
+    for (final ext in _extensionCandidates(key)) {
+      final file = File('${_cacheDir!.path}/$fileName$ext');
+      if (await file.exists()) return file;
+    }
+    return null;
+  }
+
+  /// All cache files that exist for [key] across extensions. More than one
+  /// can exist if the key was re-injected with a different mime/filename
+  /// hint; callers use this to clean up exhaustively.
+  Future<List<File>> _findAllCachedFiles(String key) async {
+    if (_cacheDir == null) await initialize();
+    final fileName = _getFileName(key);
+    final found = <File>[];
+    for (final ext in _extensionCandidates(key)) {
+      final file = File('${_cacheDir!.path}/$fileName$ext');
+      if (await file.exists()) found.add(file);
+    }
+    return found;
+  }
+
+  /// Resolve the file extension for injected content from available hints.
+  ///
+  /// Falls back to the key's own (URL-parsed) extension so storage always
+  /// agrees with [_extensionCandidates] lookups.
+  String _extensionForInjected(
+      {String? mimeType, String? filename, required String key}) {
+    switch (mimeType?.toLowerCase().trim()) {
+      case 'video/mp4':
+      case 'video/x-m4v':
+      case 'audio/mp4':
+        return '.mp4';
+      case 'video/webm':
+        return '.webm';
+      case 'video/quicktime':
+        return '.mov';
+      case 'video/mp2t':
+        return '.ts';
+    }
+    if (filename != null) {
+      final lower = filename.toLowerCase();
+      for (final ext in _knownExtensions) {
+        if (lower.endsWith(ext)) return ext;
+      }
+    }
+    final fromKey = _getExtension(key);
+    if (fromKey.isNotEmpty) return fromKey;
+    return '.mp4';
+  }
+
+  @override
+  Future<void> putBytes(
+    String key,
+    Uint8List bytes, {
+    String? mimeType,
+    String? filename,
+  }) async {
+    if (_cacheDir == null) await initialize();
+    if (bytes.isEmpty) {
+      throw ArgumentError.value(bytes, 'bytes', 'must not be empty');
+    }
+    if (bytes.length > _maxDiskCacheSize) {
+      // Soft cap: content that is about to surface is stored anyway and
+      // reclaimed by the eviction pass that runs when it leaves view.
+      debugPrint(
+          'MobileCacheManager: Injected content for $key exceeds the disk cache '
+          'limit (${_formatBytes(bytes.length)} > ${_formatBytes(_maxDiskCacheSize)}); '
+          'storing anyway, will be evicted once out of view');
+    }
+
+    final ext = _extensionForInjected(
+        mimeType: mimeType, filename: filename, key: key);
+    final file = File('${_cacheDir!.path}/${_getFileName(key)}$ext');
+
+    // Write via a unique temp file so a crash mid-write never leaves a
+    // corrupt entry that getCacheUrl would treat as complete, and so
+    // concurrent putBytes calls (or a racing URL download's .partial file)
+    // never collide. The .partial suffix keeps it covered by clear() and
+    // orphan cleanup.
+    final tmp = File('${file.path}.inj${_injectCounter++}.partial');
+    try {
+      await tmp.writeAsBytes(bytes, flush: true);
+      await tmp.rename(file.path);
+    } catch (e) {
+      try {
+        if (await tmp.exists()) await tmp.delete();
+      } catch (_) {}
+      rethrow;
+    }
+
+    // Re-injecting the same key with a different hint must not leave two
+    // files for one key behind. Swept after the rename so this converges
+    // even when concurrent injections race each other.
+    for (final stale in await _findAllCachedFiles(key)) {
+      if (stale.path == file.path) continue;
+      try {
+        await stale.delete();
+        await _downloadTracker?.deleteCacheMetadata(stale);
+      } catch (e) {
+        debugPrint('MobileCacheManager: Failed to remove stale file: $e');
+      }
+    }
+
+    final now = DateTime.now();
+    await _downloadTracker?.saveCacheMetadata(
+      file,
+      CacheMetadata(
+        url: key,
+        filePath: file.path,
+        fileSize: bytes.length,
+        created: now,
+        lastAccessed: now,
+        expires: now.add(_cacheTTL),
+      ),
+    );
+    _invalidateMetadataCache();
+
+    _memoryCache?.put(key, bytes);
+
+    // Any warm controller for this key points at the previous content;
+    // drop it so the next acquire plays the new bytes.
+    _onEvicted?.call(key);
+
+    debugPrint(
+        'MobileCacheManager: Injected ${_formatBytes(bytes.length)} for key $key');
+
+    // The just-injected key is about to surface: never evict it in this
+    // pass, even if it alone blows the cap.
+    await _runDiskEviction(extraProtected: {key});
+  }
+
   @override
   Future<String> getCacheUrl(String originalUrl,
       {Map<String, String>? headers}) async {
@@ -160,8 +332,8 @@ class MobileCacheManager implements CacheManager {
       }
     }
 
-    final file = await _getCacheFile(originalUrl);
-    if (await file.exists()) {
+    final file = await _findCachedFile(originalUrl);
+    if (file != null) {
       debugPrint('MobileCacheManager: Serving from disk: ${file.path}');
       if (_enableMetrics) {
         VideoStreamMetrics.instance.recordDiskCacheHit();
@@ -206,6 +378,14 @@ class MobileCacheManager implements CacheManager {
   @override
   Future<void> precache(String url,
       {int? bytes, Map<String, String>? headers}) async {
+    // Only http(s) URLs can be fetched. Injected (bytes/file) keys must
+    // never be requested over HTTP - the app owns fetching those.
+    final uri = Uri.tryParse(url);
+    if (uri == null || !(uri.isScheme('http') || uri.isScheme('https'))) {
+      debugPrint('MobileCacheManager: Skipping precache for non-URL key $url');
+      return;
+    }
+
     // Check if already downloading
     if (_inFlightDownloads.contains(url)) {
       debugPrint('MobileCacheManager: Download already in progress for $url');
@@ -455,11 +635,11 @@ class MobileCacheManager implements CacheManager {
 
   @override
   Future<CacheStatus> getStatus(String url) async {
-    final file = await _getCacheFile(url);
-    if (await file.exists()) {
+    if (await _findCachedFile(url) != null) {
       return CacheStatus.complete;
     }
     // Check for partial download
+    final file = await _getCacheFile(url);
     if (_downloadTracker != null &&
         await _downloadTracker!.hasValidPartial(file)) {
       return CacheStatus.partial;
@@ -469,17 +649,21 @@ class MobileCacheManager implements CacheManager {
 
   @override
   Future<void> remove(String url) async {
-    final file = await _getCacheFile(url);
-    // Remove completed file
-    if (await file.exists()) {
-      await file.delete();
+    // Remove completed file(s), whatever extension(s) stored under
+    for (final found in await _findAllCachedFiles(url)) {
+      await found.delete();
+      await _downloadTracker?.deleteCacheMetadata(found);
     }
+    final file = await _getCacheFile(url);
     // Remove any partial download
     await _downloadTracker?.cancelDownload(file);
     // Remove cache metadata
     await _downloadTracker?.deleteCacheMetadata(file);
     // Remove from memory cache
     _memoryCache?.remove(url);
+    _invalidateMetadataCache();
+    // Drop any warm controller still pointing at the removed content
+    _onEvicted?.call(url);
   }
 
   /// Check if a file path represents a cache file.
@@ -489,6 +673,7 @@ class MobileCacheManager implements CacheManager {
         path.endsWith('.mov') ||
         path.endsWith('.ts') ||
         path.endsWith('.m4s') ||
+        path.endsWith('.m3u8') ||
         path.endsWith('.webm') ||
         path.endsWith('.partial') ||
         path.endsWith('.meta') ||
@@ -567,10 +752,16 @@ class MobileCacheManager implements CacheManager {
 
   // ============ Disk Cache Eviction Methods ============
 
+  @override
+  Future<void> evictIfNeeded() => _runDiskEviction();
+
   /// Run LRU eviction on disk cache when over size limit.
   ///
   /// Evicts least recently accessed files until under [_maxDiskCacheSize].
-  Future<void> _runDiskEviction() async {
+  /// Surfaced videos (currently acquired by a player) and [extraProtected]
+  /// keys are never evicted - the size cap only applies to content that is
+  /// out of view, so the cache may temporarily stay over the cap.
+  Future<void> _runDiskEviction({Set<String> extraProtected = const {}}) async {
     if (_downloadTracker == null || _cacheDir == null) return;
 
     try {
@@ -586,6 +777,11 @@ class MobileCacheManager implements CacheManager {
 
       if (totalSize <= _maxDiskCacheSize) return;
 
+      final protected = <String>{
+        ...?_activeKeysProvider?.call(),
+        ...extraProtected,
+      };
+
       debugPrint(
           'MobileCacheManager: Disk cache over limit (${_formatBytes(totalSize)} > ${_formatBytes(_maxDiskCacheSize)})');
 
@@ -600,13 +796,19 @@ class MobileCacheManager implements CacheManager {
       for (final meta in sortedMetadata) {
         if (totalSize <= _maxDiskCacheSize) break;
 
+        // Never evict a video that is currently surfaced
+        if (protected.contains(meta.url)) continue;
+
         final file = File(meta.filePath);
         if (await file.exists()) {
           await file.delete();
           await _downloadTracker!.deleteCacheMetadata(file);
+          _memoryCache?.remove(meta.url);
           totalSize -= meta.fileSize;
           evictedSize += meta.fileSize;
           evictedCount++;
+          // Drop any warm controller still pointing at the evicted file
+          _onEvicted?.call(meta.url);
         }
       }
 

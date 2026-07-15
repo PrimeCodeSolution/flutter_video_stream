@@ -50,6 +50,12 @@ class PreloadManager with LifecycleAware {
   final Queue<String> _preloadQueue = Queue();
   final Set<String> _preloadQueueSet = {}; // O(1) lookup for duplicates
   final Map<String, int> _registeredUrls = {};
+
+  /// Keys of injected (bytes/file) sources. They are already local, so
+  /// preloading is a no-op for them — and they must never be fetched over
+  /// HTTP. They still occupy their feed index so neighboring URL sources
+  /// preload normally.
+  final Set<String> _localKeys = {};
   int? _activeIndex;
   bool _isProcessing = false;
   bool _isDisposed = false;
@@ -65,18 +71,27 @@ class PreloadManager with LifecycleAware {
     this.precacheMobile = true,
   }) : _cacheManager = cacheManager;
 
-  /// Registers a video URL with an optional priority index.
-  /// This is called automatically by VideoStreamPlayer.
-  void register(String url, int? index) {
+  /// Registers a video key (the URL in the URL flow) with an optional
+  /// priority index. This is called automatically by VideoStreamPlayer.
+  ///
+  /// Pass `preloadable: false` for injected (bytes/file) sources: their
+  /// index still counts for neighbor lookups, but they are never fetched.
+  void register(String url, int? index, {bool preloadable = true}) {
+    if (preloadable) {
+      _localKeys.remove(url);
+    } else {
+      _localKeys.add(url);
+    }
     if (index != null) {
       _registeredUrls[url] = index;
       _recalculatePriorities();
     }
   }
 
-  /// Unregisters a video URL.
+  /// Unregisters a video key.
   void unregister(String url) {
     _registeredUrls.remove(url);
+    _localKeys.remove(url);
     // No need to aggressively recalculate on remove, just let queue drain or next update handle it.
   }
 
@@ -96,9 +111,12 @@ class PreloadManager with LifecycleAware {
 
       _recalculatePriorities();
 
-      // On web, notify the web preloader to warm up nearby videos
+      // On web, notify the web preloader to warm up nearby videos.
+      // Injected keys are filtered out - they cannot be network-warmed.
       if (kIsWeb) {
-        VideoStream.instance.webPreloader?.notifyActive(index, _registeredUrls);
+        final warmable = Map<String, int>.fromEntries(_registeredUrls.entries
+            .where((e) => !_localKeys.contains(e.key)));
+        VideoStream.instance.webPreloader?.notifyActive(index, warmable);
       }
     }
   }
@@ -123,7 +141,9 @@ class PreloadManager with LifecycleAware {
               orElse: () => MapEntry('', -1))
           .key;
 
-      if (url.isNotEmpty && !_preloadQueueSet.contains(url)) {
+      if (url.isNotEmpty &&
+          !_localKeys.contains(url) &&
+          !_preloadQueueSet.contains(url)) {
         targets.add(url);
         _preloadQueueSet.add(url);
       }
@@ -134,7 +154,9 @@ class PreloadManager with LifecycleAware {
     final prevUrl = _registeredUrls.entries
         .firstWhere((e) => e.value == prevIndex, orElse: () => MapEntry('', -1))
         .key;
-    if (prevUrl.isNotEmpty && !_preloadQueueSet.contains(prevUrl)) {
+    if (prevUrl.isNotEmpty &&
+        !_localKeys.contains(prevUrl) &&
+        !_preloadQueueSet.contains(prevUrl)) {
       targets.add(prevUrl);
       _preloadQueueSet.add(prevUrl);
     }
@@ -187,6 +209,9 @@ class PreloadManager with LifecycleAware {
 
         final url = _preloadQueue.removeFirst();
         _preloadQueueSet.remove(url);
+
+        // Never fetch injected (bytes/file) keys over HTTP
+        if (_localKeys.contains(url)) continue;
 
         // Check if we should still preload this (is it still near active index?)
         // If user scrolled fast, this URL might now be far away
@@ -253,6 +278,7 @@ class PreloadManager with LifecycleAware {
     _preloadQueue.clear();
     _preloadQueueSet.clear();
     _registeredUrls.clear();
+    _localKeys.clear();
     _activeIndex = null;
 
     // Unregister from lifecycle observer

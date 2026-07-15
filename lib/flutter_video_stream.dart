@@ -22,11 +22,25 @@
 ///
 /// - [VideoStream] - Singleton for initialization and cache management
 /// - [VideoStreamPlayer] - Widget for video playback
+/// - [VideoSource] - Video content descriptor (URL, caller-supplied bytes, or file)
 /// - [VideoStreamConfig] - Configuration options
 /// - [VideoStreamController] - Global playback controller
 /// - [CacheManager] - Cache interface and status
+/// - [VideoStreamError] - Detailed error information
+/// - [VideoStreamErrorType] - Error type classification
+///
+/// ## Bring your own bytes
+///
+/// For content the package cannot fetch itself (e.g. end-to-end encrypted
+/// attachments the app downloads and decrypts), hand over plaintext bytes:
+///
+/// ```dart
+/// await VideoStream.precacheBytes(eventId, decryptedBytes);
+/// VideoStreamPlayer(source: VideoSource.bytes(decryptedBytes, key: eventId));
+/// ```
 library;
 
+export 'src/source/video_source.dart';
 export 'src/video_stream.dart';
 export 'src/video_stream_player.dart';
 export 'src/config/video_stream_config.dart';
