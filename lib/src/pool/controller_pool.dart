@@ -93,42 +93,69 @@ class ControllerPool {
   /// [VideoSource.file]) sources play from the local cache and never touch
   /// the HTTP proxy; if their cached content is gone and cannot be
   /// re-materialized locally, a [VideoSourceNotCachedException] is thrown.
-  Future<VideoPlayerController> acquireSource(VideoSource source) async {
-    final key = source.key;
+  Future<VideoPlayerController> acquireSource(VideoSource source) =>
+      _acquireShared(source.key, () => _acquireNew(source));
 
+  /// Joins the controller for [key] without re-supplying its source.
+  ///
+  /// Joins a live or warm pooled controller (or an acquisition in flight).
+  /// If the pool has nothing for [key], the content is re-materialized:
+  /// from the cache when it holds an entry for [key], or over the network
+  /// when [key] itself is an http(s) URL. Otherwise throws
+  /// [VideoSourceNotCachedException].
+  Future<VideoPlayerController> attachKey(String key) =>
+      _acquireShared(key, () => _attachNew(key));
+
+  /// The shared acquisition discipline: pin the key for the whole
+  /// operation, join a pooled or in-flight controller, otherwise run
+  /// [acquireNew] as the single in-flight acquisition for the key.
+  Future<VideoPlayerController> _acquireShared(
+    String key,
+    Future<VideoPlayerController> Function() acquireNew,
+  ) async {
     // Pin the key for the whole acquisition so just-materialized content
     // cannot be evicted before the pooled entry registers as surfaced.
     _acquiringKeys[key] = (_acquiringKeys[key] ?? 0) + 1;
     try {
-      // Check if already active
-      if (_activeControllers.containsKey(key)) {
-        final pooled = _activeControllers[key]!;
-        pooled.refCount++;
-        // If was just released but not collected, mark active
-        pooled.lastReleased = null;
-        return pooled.controller;
-      }
-
-      // Join an acquisition already in flight for this key
-      final inFlight = _inFlight[key];
-      if (inFlight != null) {
-        final controller = await inFlight;
-        final pooled = _activeControllers[key];
-        if (pooled != null) {
-          pooled.refCount++;
-          pooled.lastReleased = null;
-          return pooled.controller;
+      while (true) {
+        // Check if already active
+        final active = _activeControllers[key];
+        if (active != null) {
+          active.refCount++;
+          // If was just released but not collected, mark active
+          active.lastReleased = null;
+          return active.controller;
         }
-        // Pooled entry already evicted between completion and this await
-        return controller;
-      }
 
-      final acquisition = _acquireNew(source);
-      _inFlight[key] = acquisition;
-      try {
-        return await acquisition;
-      } finally {
-        _inFlight.remove(key);
+        // Join an acquisition already in flight for this key
+        final inFlight = _inFlight[key];
+        if (inFlight != null) {
+          try {
+            await inFlight;
+          } catch (_) {
+            // The creator's acquisition failed, but this caller may succeed
+            // with its own creation path (e.g. an acquire holding bytes
+            // that joined a doomed attach). Clear the failed future if the
+            // creator's cleanup hasn't run yet, then retry ourselves.
+            if (identical(_inFlight[key], inFlight)) {
+              _inFlight.remove(key);
+            }
+            continue;
+          }
+          // Loop: normally the pooled entry now exists and is joined above.
+          // If it was already evicted again (creator released instantly and
+          // the pool overflowed), retry rather than hand out a reference
+          // the pool no longer tracks.
+          continue;
+        }
+
+        final acquisition = acquireNew();
+        _inFlight[key] = acquisition;
+        try {
+          return await acquisition;
+        } finally {
+          _inFlight.remove(key);
+        }
       }
     } finally {
       final remaining = (_acquiringKeys[key] ?? 1) - 1;
@@ -162,6 +189,32 @@ class ControllerPool {
     }
 
     final controller = await _createController(source);
+    return _register(key, controller);
+  }
+
+  /// Create-and-register path for [attachKey] when nothing is pooled.
+  Future<VideoPlayerController> _attachNew(String key) async {
+    // Cache hit (injected content or a fully cached URL): play locally.
+    final cacheUrl = await VideoStream.instance.cacheManager.getCacheUrl(key);
+    if (cacheUrl != key) {
+      final controller = createLocalController(cacheUrl,
+          options: VideoStream.instance.config.playerOptions);
+      return _register(key, controller);
+    }
+
+    // A URL key fully describes its source, so it is always
+    // re-materializable over the network.
+    final uri = Uri.tryParse(key);
+    if (uri != null && (uri.isScheme('http') || uri.isScheme('https'))) {
+      return _acquireNew(VideoSource.url(key));
+    }
+
+    throw VideoSourceNotCachedException(key);
+  }
+
+  /// Initializes [controller] and registers it in the pool under [key].
+  Future<VideoPlayerController> _register(
+      String key, VideoPlayerController controller) async {
 
     // Initialize is usually called by the user widget, but we can do it here to "warm up"
     // However, VideoStreamPlayer will call initialize.
@@ -192,6 +245,11 @@ class ControllerPool {
   }
 
   Future<VideoPlayerController> _createController(VideoSource source) async {
+    // Per-source options win over the global config value. Same-key sources
+    // share one controller, so the first creation's options stick.
+    final options =
+        source.playerOptions ?? VideoStream.instance.config.playerOptions;
+
     switch (source) {
       case UrlVideoSource(:final url, :final headers):
         // First check if we have a complete cache file
@@ -217,22 +275,69 @@ class ControllerPool {
         return VideoPlayerController.networkUrl(
           Uri.parse(playbackUrl),
           httpHeaders: headers ?? {},
+          videoPlayerOptions: options,
         );
 
       case BytesVideoSource():
-        return createLocalController(await _materializeInjected(
-          source.key,
-          () async => source.bytes,
-          mimeType: source.mimeType,
-          filename: source.filename,
-        ));
+        return createLocalController(
+          await _materializeInjected(
+            source.key,
+            () async => source.bytes,
+            mimeType: source.mimeType,
+            filename: source.filename,
+          ),
+          options: options,
+        );
 
       case FileVideoSource():
-        return createLocalController(await _materializeInjected(
-          source.key,
-          () => readSourceFile(source.path),
-        ));
+        return createLocalController(
+          await _materializeInjected(
+            source.key,
+            () => readSourceFile(source.path),
+          ),
+          options: options,
+        );
     }
+  }
+
+  /// Pauses every pooled controller whose key differs from [key] and whose
+  /// video is currently playing. Sessions/players on the same key are
+  /// siblings sharing one controller and are never paused by this.
+  Future<void> pauseAllExcept(String key) async {
+    for (final pooled in List<_PooledController>.from(_pool)) {
+      if (pooled.key == key) continue;
+      final controller = pooled.controller;
+      if (!controller.value.isPlaying) continue;
+      try {
+        await controller.pause();
+      } catch (e) {
+        debugPrint('ControllerPool: Failed to pause ${pooled.key}: $e');
+      }
+    }
+  }
+
+  /// Monotonic ticket serializing exclusive plays: when two exclusive plays
+  /// race, only the most recent one actually starts (last wins) - so
+  /// "playback never overlaps" holds even across the pause round-trips.
+  int _exclusiveTicket = 0;
+
+  /// The exclusive-play primitive: pause everything but [key], then start
+  /// [controller] - unless a newer exclusive play superseded this one during
+  /// the pause round-trip, or [isCancelled] reports the caller no longer
+  /// wants playback (e.g. its session was released mid-await).
+  Future<void> playExclusive(
+    String key,
+    VideoPlayerController controller, {
+    bool Function()? isCancelled,
+  }) async {
+    final ticket = ++_exclusiveTicket;
+    await pauseAllExcept(key);
+    if (ticket != _exclusiveTicket || (isCancelled?.call() ?? false)) {
+      // Superseded or cancelled while pausing others: starting now would
+      // resurrect a video that should stay paused (or has no owner).
+      return;
+    }
+    await controller.play();
   }
 
   /// Resolves an injected source key to a locally playable path/URL.
@@ -278,6 +383,13 @@ class ControllerPool {
     // Don't dispose immediately - keep warm for quick re-access
     if (pooled.refCount <= 0) {
       pooled.lastReleased = DateTime.now();
+      // Nobody references this controller anymore: a still-playing video
+      // would be ownerless ghost audio, so stop it (fire-and-forget).
+      if (pooled.controller.value.isPlaying) {
+        pooled.controller.pause().catchError((Object e) {
+          debugPrint('ControllerPool: Pause on release failed for $key: $e');
+        });
+      }
       // The video left view: over-cap content may now be reclaimed
       onKeyReleased?.call(key);
     }

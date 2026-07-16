@@ -1,6 +1,6 @@
 name: flutter_video_stream
 description: "High-performance video streaming package for Flutter with intelligent caching, controller pooling, and preloading. Supports MP4 and HLS formats on mobile and web."
-version: 0.2.0
+version: 0.3.0
 homepage: https://github.com/PrimeCodeSolution/flutter_video_stream
 repository: https://github.com/PrimeCodeSolution/flutter_video_stream
 issue_tracker: https://github.com/PrimeCodeSolution/flutter_video_stream/issues

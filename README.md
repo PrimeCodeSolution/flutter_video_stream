@@ -23,7 +23,7 @@ Add to your `pubspec.yaml`:
 
 ```yaml
 dependencies:
-  flutter_video_stream: ^0.1.0
+  flutter_video_stream: ^0.3.0
 ```
 
 ## Quick Start
@@ -197,6 +197,82 @@ VideoStreamPlayer(
 `VideoSource.bytes` self-heals: if its cache entry was evicted, the bytes it
 carries are transparently re-injected on the next acquire — no error, no
 network.
+
+### Bring your own UI (VideoSession)
+
+If you build your own player chrome instead of using `VideoStreamPlayer`,
+acquire a `VideoSession`: a handle that owns exactly one reference to the
+shared pooled controller. No key→source maps, no refcount bookkeeping, no
+registry of "other videos I must pause" — the package does all of that.
+
+```dart
+class _MyPlayerState extends State<MyPlayer> {
+  VideoSession? _session;
+
+  Future<void> _init() async {
+    final session = await VideoStream.acquire(
+      VideoSource.bytes(decryptedBytes, key: message.id),
+    );
+    if (!mounted) {
+      session.release();
+      return;
+    }
+    setState(() => _session = session);
+    await session.play(); // exclusive: pauses every other video first
+  }
+
+  @override
+  Widget build(BuildContext context) => _session == null
+      ? const CircularProgressIndicator()
+      : VideoPlayer(_session!.controller); // your own controls around it
+
+  @override
+  void dispose() {
+    _session?.release(); // exactly once; the pool keeps it warm for reuse
+    super.dispose();
+  }
+}
+```
+
+Opening the same video on another screen (e.g. fullscreen) joins the same
+controller by key — playback continues seamlessly, no second player:
+
+```dart
+// Fullscreen page: only the key travels through the route.
+final session = await VideoStream.attach(key);
+// session.controller is the SAME controller the inline tile uses.
+```
+
+`attach(key)` joins a live or warm controller, re-materializes from the
+cache, or — for http(s) URL keys — refetches. For an injected key with
+nothing recoverable it throws `VideoSourceNotCachedException`, so the app
+can re-download/re-inject.
+
+`session.play()` is exclusive by default and shares its exclusion primitive
+(`VideoStream.pauseAllExcept`) with `VideoStreamPlayer` — a session video
+and a widget video never play at the same time.
+
+When two widgets share one controller during a handoff, only one should
+render the texture. `VideoStream.surfaceArbiter` is a canonical
+`ChangeNotifier` answering who:
+
+```dart
+VideoStream.surfaceArbiter.claim('fullscreen:$key');   // page takes over
+// inline tile listens and renders a thumbnail while it is not the owner
+VideoStream.surfaceArbiter.release('fullscreen:$key'); // page pops
+```
+
+Need iOS videos to survive route pushes (or other `VideoPlayerOptions`)?
+Set them globally or per source; with a shared controller, the first
+creation for a key wins:
+
+```dart
+await VideoStream.initialize(
+  config: VideoStreamConfig(
+    playerOptions: VideoPlayerOptions(allowBackgroundPlayback: true),
+  ),
+);
+```
 
 ### Controlling Playback
 

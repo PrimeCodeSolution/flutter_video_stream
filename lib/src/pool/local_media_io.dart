@@ -3,8 +3,9 @@ import 'dart:typed_data';
 
 import 'package:video_player/video_player.dart';
 
-VideoPlayerController createLocalController(String pathOrUrl) =>
-    VideoPlayerController.file(File(pathOrUrl));
+VideoPlayerController createLocalController(String pathOrUrl,
+        {VideoPlayerOptions? options}) =>
+    VideoPlayerController.file(File(pathOrUrl), videoPlayerOptions: options);
 
 Future<Uint8List?> readSourceFile(String path) async {
   final file = File(path);

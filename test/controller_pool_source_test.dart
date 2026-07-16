@@ -1,5 +1,8 @@
 // End-to-end tests for the VideoSource path through VideoStream.initialize
 // and ControllerPool.acquireSource, written against the 0.2.0 design spec.
+// These deliberately exercise the raw pool API, deprecated for consumers
+// in 0.3.0 in favor of VideoSession.
+// ignore_for_file: deprecated_member_use_from_same_package
 //
 // Two fakes stand in for the platform:
 // - FakeVideoPlayerPlatform extends (not implements) VideoPlayerPlatform

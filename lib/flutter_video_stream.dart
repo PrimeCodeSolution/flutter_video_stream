@@ -22,7 +22,9 @@
 ///
 /// - [VideoStream] - Singleton for initialization and cache management
 /// - [VideoStreamPlayer] - Widget for video playback
+/// - [VideoSession] - Handle-based controller access for custom player UIs
 /// - [VideoSource] - Video content descriptor (URL, caller-supplied bytes, or file)
+/// - [VideoSurfaceArbiter] - Who-renders-the-texture arbiter for surface handoff
 /// - [VideoStreamConfig] - Configuration options
 /// - [VideoStreamController] - Global playback controller
 /// - [CacheManager] - Cache interface and status
@@ -40,6 +42,7 @@
 /// ```
 library;
 
+export 'src/session/video_surface_arbiter.dart';
 export 'src/source/video_source.dart';
 export 'src/video_stream.dart';
 export 'src/video_stream_player.dart';

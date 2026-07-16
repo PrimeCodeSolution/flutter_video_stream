@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'package:flutter/foundation.dart';
 import 'package:video_player/video_player.dart';
+import '../video_stream.dart';
 
 /// Factory function for conditional import
 WebPreloader getWebPreloader() => WebPreloader._();
@@ -74,9 +75,12 @@ class WebPreloader {
   Future<void> _initializeController(
       String url, Map<String, String>? headers) async {
     try {
+      // Warmed controllers get adopted by the pool, so they must carry the
+      // same options the pool would apply.
       final controller = VideoPlayerController.networkUrl(
         Uri.parse(url),
         httpHeaders: headers ?? {},
+        videoPlayerOptions: VideoStream.instance.config.playerOptions,
       );
 
       final warm = _WarmController(

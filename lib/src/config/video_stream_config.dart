@@ -1,7 +1,17 @@
+import 'package:video_player/video_player.dart' show VideoPlayerOptions;
+
 /// Configuration for the VideoStream package
 class VideoStreamConfig {
   /// Maximum size of the disk cache in bytes
   final int maxCacheSize;
+
+  /// [VideoPlayerOptions] applied to every controller the package creates.
+  ///
+  /// For example, on iOS videos pause during route pushes unless
+  /// `VideoPlayerOptions(allowBackgroundPlayback: true)` is set. A
+  /// per-source `VideoSource.playerOptions` takes precedence over this
+  /// value.
+  final VideoPlayerOptions? playerOptions;
 
   /// Maximum size of the memory cache in bytes (RAM)
   final int maxMemoryCacheSize;
@@ -83,6 +93,7 @@ class VideoStreamConfig {
   final int maxBandwidthBytesPerSecond;
 
   const VideoStreamConfig({
+    this.playerOptions,
     this.maxCacheSize = 500 * 1024 * 1024, // 500MB
     this.maxMemoryCacheSize = 100 * 1024 * 1024, // 100MB
     this.preloadCount = 2,

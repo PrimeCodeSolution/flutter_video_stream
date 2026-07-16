@@ -9,9 +9,10 @@ import 'local_media_io.dart'
 ///
 /// [pathOrUrl] is a cache file path on mobile, or a `blob:` / `data:` URL on
 /// web. Injected sources always go through here — never through the HTTP
-/// proxy.
-VideoPlayerController createLocalController(String pathOrUrl) =>
-    platform.createLocalController(pathOrUrl);
+/// proxy. [options] are passed through to the controller constructor.
+VideoPlayerController createLocalController(String pathOrUrl,
+        {VideoPlayerOptions? options}) =>
+    platform.createLocalController(pathOrUrl, options: options);
 
 /// Reads the file at [path] for importing a [VideoSource.file] into the
 /// cache. Returns null when the file is missing or the platform has no file

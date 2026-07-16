@@ -199,6 +199,9 @@ class VideoStreamPlayer extends StatefulWidget {
 }
 
 class _VideoStreamPlayerState extends State<VideoStreamPlayer> {
+  /// The session owning this widget's pool reference. The controller is
+  /// shared with other sessions/players on the same key.
+  VideoSession? _session;
   VideoPlayerController? _controller;
   bool _isInitialized = false;
   bool _isBuffering = false;
@@ -254,10 +257,11 @@ class _VideoStreamPlayerState extends State<VideoStreamPlayer> {
     // Small delay to let the UI update before play
     await Future.delayed(const Duration(milliseconds: 50));
 
-    if (!mounted || _controller == null) return;
+    if (!mounted || _session == null) return;
 
     try {
-      await _controller!.play();
+      // Exclusive: pauses any other playing video (session- or widget-based)
+      await _session!.play();
     } catch (e) {
       debugPrint('Play failed after interaction: $e');
     }
@@ -304,14 +308,16 @@ class _VideoStreamPlayerState extends State<VideoStreamPlayer> {
       VideoStream.instance.preloadManager.register(
           _sourceKey, widget.priorityIndex,
           preloadable: _source is UrlVideoSource);
-      _disposeController(oldKey);
+      // The old session is bound to the old key; releasing it is all the
+      // bookkeeping a key change needs.
+      _disposeController();
       _initializePlayer();
     } else {
       // Handle autoPlay toggle (e.g. scrolling in feed)
       // Note: On web, autoplay is disabled so this only affects pause
       if (oldWidget.autoPlay != widget.autoPlay) {
         // Defer play/pause to after the build phase to avoid setState during build
-        WidgetsBinding.instance.addPostFrameCallback((_) {
+        WidgetsBinding.instance.addPostFrameCallback((_) async {
           if (!mounted) return;
           if (_effectiveAutoPlay) {
             // Changed to true -> Play (mobile only, never happens on web)
@@ -325,7 +331,14 @@ class _VideoStreamPlayerState extends State<VideoStreamPlayer> {
             VideoStreamController.instance
                 .setActiveController(_controller, _sourceKey);
 
-            _controller?.play();
+            // Exclusive play: pauses any other playing video
+            await _session?.play();
+            // A fast scroll can deactivate this item while the exclusion
+            // round-trip above was in flight - don't leave it playing
+            // offscreen.
+            if (!mounted || !_effectiveAutoPlay) {
+              _controller?.pause();
+            }
           } else if (!widget.autoPlay) {
             // Changed to false -> Pause (works on all platforms)
             _controller?.pause();
@@ -360,16 +373,16 @@ class _VideoStreamPlayerState extends State<VideoStreamPlayer> {
         _error = null;
       });
 
-      final controller =
-          await VideoStream.instance.controllerPool.acquireSource(source);
+      final session = await VideoStream.acquire(source);
 
       // Only commit if this is still the newest init request for the
       // current source - otherwise release and let the newer one take over
       if (!mounted || generation != _initGeneration || _sourceKey != key) {
-        VideoStream.instance.controllerPool.release(key);
+        session.release();
         return;
       }
-      _controller = controller;
+      _session = session;
+      _controller = session.controller;
 
       _controller!.addListener(_onPlayerUpdate);
 
@@ -498,7 +511,10 @@ class _VideoStreamPlayerState extends State<VideoStreamPlayer> {
   }
 
   Future<void> _onInitialized() async {
-    if (!mounted || _controller == null) return;
+    // Capture locally: the widget can be disposed (nulling the fields)
+    // while the awaits below are in flight.
+    final session = _session;
+    if (!mounted || _controller == null || session == null) return;
 
     try {
       if (widget.looping) {
@@ -518,7 +534,16 @@ class _VideoStreamPlayerState extends State<VideoStreamPlayer> {
         VideoStreamController.instance
             .setActiveController(_controller, _sourceKey);
 
-        await _controller!.play();
+        // Exclusive play: widget-based and session-based playback share
+        // the same exclusion primitive and never overlap. Throws
+        // StateError if the widget was disposed (session released) during
+        // the awaits above - caught below like any init failure.
+        await session.play();
+        // Deactivated while initialization/exclusion was in flight (fast
+        // feed scroll): don't leave this item playing offscreen.
+        if (!mounted || !_effectiveAutoPlay) {
+          await _controller?.pause();
+        }
       }
 
       if (mounted) {
@@ -575,12 +600,13 @@ class _VideoStreamPlayerState extends State<VideoStreamPlayer> {
     }
   }
 
-  void _disposeController([String? key]) {
+  void _disposeController() {
     if (_controller != null) {
       _controller!.removeListener(_onPlayerUpdate);
-      VideoStream.instance.controllerPool.release(key ?? _sourceKey);
       _controller = null;
     }
+    _session?.release();
+    _session = null;
   }
 
   @override

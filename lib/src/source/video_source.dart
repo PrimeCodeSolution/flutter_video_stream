@@ -1,5 +1,7 @@
 import 'dart:typed_data';
 
+import 'package:video_player/video_player.dart' show VideoPlayerOptions;
+
 /// Describes where a video's content comes from.
 ///
 /// [VideoSource] is the identity and content descriptor for everything the
@@ -40,12 +42,23 @@ sealed class VideoSource {
   /// a URL keys the pipeline in the URL flow.
   String get key;
 
+  /// Optional [VideoPlayerOptions] applied when this source's controller is
+  /// created, taking precedence over `VideoStreamConfig.playerOptions`.
+  ///
+  /// Note: two sources with the same [key] share one pooled controller, so
+  /// the options of whichever source triggers the **first** creation win;
+  /// later joins reuse that controller unchanged.
+  VideoPlayerOptions? get playerOptions;
+
   /// A video fetched over HTTP (existing behavior, unchanged).
   ///
   /// [url] doubles as the [key]. Optional [headers] are sent with every
   /// request for this video.
-  const factory VideoSource.url(String url, {Map<String, String>? headers}) =
-      UrlVideoSource;
+  const factory VideoSource.url(
+    String url, {
+    Map<String, String>? headers,
+    VideoPlayerOptions? playerOptions,
+  }) = UrlVideoSource;
 
   /// Caller-supplied plaintext video bytes.
   ///
@@ -63,6 +76,7 @@ sealed class VideoSource {
     required String key,
     String? mimeType,
     String? filename,
+    VideoPlayerOptions? playerOptions,
   }) = BytesVideoSource;
 
   /// Video content that already exists on disk at [path].
@@ -71,8 +85,11 @@ sealed class VideoSource {
   /// cache entry and the file at [path] are gone when the source is acquired,
   /// a [VideoSourceNotCachedException] is thrown so the app can re-download
   /// and re-inject. Not supported on web.
-  const factory VideoSource.file(String path, {required String key}) =
-      FileVideoSource;
+  const factory VideoSource.file(
+    String path, {
+    required String key,
+    VideoPlayerOptions? playerOptions,
+  }) = FileVideoSource;
 }
 
 /// A video fetched over HTTP. See [VideoSource.url].
@@ -83,8 +100,11 @@ final class UrlVideoSource extends VideoSource {
   /// Optional HTTP headers for the video request.
   final Map<String, String>? headers;
 
+  @override
+  final VideoPlayerOptions? playerOptions;
+
   /// Creates a URL-backed video source.
-  const UrlVideoSource(this.url, {this.headers});
+  const UrlVideoSource(this.url, {this.headers, this.playerOptions});
 
   @override
   String get key => url;
@@ -105,12 +125,16 @@ final class BytesVideoSource extends VideoSource {
   /// [mimeType] is not provided.
   final String? filename;
 
+  @override
+  final VideoPlayerOptions? playerOptions;
+
   /// Creates a bytes-backed video source.
   const BytesVideoSource(
     this.bytes, {
     required this.key,
     this.mimeType,
     this.filename,
+    this.playerOptions,
   });
 }
 
@@ -122,8 +146,11 @@ final class FileVideoSource extends VideoSource {
   @override
   final String key;
 
+  @override
+  final VideoPlayerOptions? playerOptions;
+
   /// Creates a file-backed video source.
-  const FileVideoSource(this.path, {required this.key});
+  const FileVideoSource(this.path, {required this.key, this.playerOptions});
 }
 
 /// Thrown when an injected ([VideoSource.bytes] / [VideoSource.file]) source

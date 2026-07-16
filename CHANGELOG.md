@@ -1,3 +1,32 @@
+## 0.3.0
+
+- **`VideoSession` — handle-based API for custom player UIs**
+  - `VideoStream.acquire(source)` returns a session owning exactly one pool
+    reference; same-key acquisitions join one shared controller (racing
+    acquisitions share a single creation)
+  - `VideoStream.attach(key)` joins a live/warm key without re-supplying the
+    source; re-materializes from cache (or network for URL keys); throws
+    `VideoSourceNotCachedException` for unknown keys
+  - `session.release()` is exactly-once and idempotent (debug assert on
+    double release); using a released session throws `StateError`
+  - No more app-side key→source maps, refcount bookkeeping, or
+    live-controller registries for custom UIs
+- **Unified play exclusion**
+  - `session.play()` (exclusive by default) and `VideoStream.pauseAllExcept(key)`
+    pause every other playing video; same-key siblings are never paused
+  - `VideoStreamPlayer` routes its play paths through the same primitive, so
+    widget-based and session-based playback never overlap
+- **`VideoPlayerOptions` passthrough**
+  - `VideoStreamConfig.playerOptions` applies to every controller the package
+    creates (e.g. `allowBackgroundPlayback: true` to survive iOS route pushes)
+  - Optional per-source override `VideoSource.*(playerOptions:)`; with a
+    shared controller the first creation for a key wins
+- **`VideoSurfaceArbiter`** (`VideoStream.surfaceArbiter`) — a canonical
+  "who renders the texture" `ChangeNotifier` for inline↔fullscreen handoff
+  with one shared controller
+- `VideoStream.instance.controllerPool` is deprecated (removal in 0.4.0):
+  use the session API instead
+
 ## 0.2.0
 
 - **Bring your own bytes: `VideoSource` abstraction** for content the package
